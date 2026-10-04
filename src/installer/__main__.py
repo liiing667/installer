@@ -1,15 +1,18 @@
 """Installer CLI."""
 
 import argparse
+import json
 import os.path
 import sys
 import sysconfig
 from collections.abc import Sequence
+from pathlib import Path
 
 import installer
-from installer.destinations import SchemeDictionaryDestination
+from installer.destinations import PlanDestination, SchemeDictionaryDestination
+from installer.records import RecordEntry
 from installer.sources import WheelFile
-from installer.utils import get_launcher_kind
+from installer.utils import SCHEME_NAMES, Scheme, get_launcher_kind
 
 
 def _get_main_parser() -> argparse.ArgumentParser:
@@ -56,6 +59,23 @@ def _get_main_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="silently overwrite existing files",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "don't write any files; print the files that would be installed, "
+            "grouped by scheme"
+        ),
+    )
+    parser.add_argument(
+        "--plan-json",
+        metavar="path",
+        type=str,
+        help=(
+            "write the installation plan as machine-readable JSON to this path "
+            "(the only file that gets written; implies --dry-run)"
+        ),
+    )
     return parser
 
 
@@ -96,11 +116,17 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
     elif not bytecode_levels:
         bytecode_levels = [0, 1]
 
+    plan_mode = args.dry_run or args.plan_json is not None
+    plan_reports: list[dict[str, object]] = []
+
     for wheel in args.wheel:
         with WheelFile.open(wheel) as source:
             if args.validate_record != "none":
                 source.validate_record(validate_contents=args.validate_record == "all")
-            destination = SchemeDictionaryDestination(
+            destination_class = (
+                PlanDestination if plan_mode else SchemeDictionaryDestination
+            )
+            destination = destination_class(
                 scheme_dict=_get_scheme_dict(source.distribution, prefix=args.prefix),
                 interpreter=sys.executable,
                 script_kind=get_launcher_kind(),
@@ -109,6 +135,45 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
                 overwrite_existing=args.overwrite_existing,
             )
             installer.install(source, destination, {})
+            if plan_mode:
+                schemes = _plan_schemes(destination.plan)
+                plan_reports.append({"wheel": wheel, "schemes": schemes})
+                _print_plan_report(wheel, schemes)
+
+    if args.plan_json is not None:
+        Path(args.plan_json).write_text(
+            json.dumps(plan_reports, indent=2) + "\n", encoding="utf-8"
+        )
+
+
+def _plan_schemes(
+    plan: list[tuple[Scheme, RecordEntry, str]]
+) -> dict[str, list[dict[str, str | int | None]]]:
+    """Group the recorded plan entries by scheme, in scheme order."""
+    schemes: dict[str, list[dict[str, str | int | None]]] = {
+        name: [] for name in SCHEME_NAMES
+    }
+    for scheme, record, target_path in plan:
+        schemes[scheme].append(
+            {
+                "path": record.path,
+                "destination": target_path,
+                "hash": str(record.hash_) if record.hash_ is not None else None,
+                "size": record.size,
+            }
+        )
+    return {name: schemes[name] for name in SCHEME_NAMES if schemes[name]}
+
+
+def _print_plan_report(
+    wheel: str, schemes: dict[str, list[dict[str, str | int | None]]]
+) -> None:
+    """Print the installation plan, grouped by scheme."""
+    lines = [f"Would install {wheel}:"]
+    for scheme, entries in schemes.items():
+        lines.append(f"[{scheme}]")
+        lines.extend(f"  {entry['destination']}" for entry in entries)
+    print("\n".join(lines))  # noqa: T201
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `--dry-run` and `--plan-json` CLI options, which compute the installation
+  plan (grouped by scheme) without writing anything to the filesystem
 - Use `os.path.commonpath` instead of `os.path.commonprefix` to address deprecation
   warnings on Python 3.15 (#345)
 

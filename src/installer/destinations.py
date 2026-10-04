@@ -3,7 +3,7 @@
 import io
 import os
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -304,3 +304,68 @@ class SchemeDictionaryDestination(WheelDestination):
 
         for scheme_, record in record_list:
             self._compile_bytecode(scheme_, record)
+
+
+class _DiscardingSink:
+    """A file-like object that discards anything written to it."""
+
+    def write(self, data: bytes) -> int:
+        """Discard ``data``, returning its length."""
+        return len(data)
+
+
+@dataclass
+class PlanDestination(SchemeDictionaryDestination):
+    """A destination that computes an installation plan, without writing anything.
+
+    Behaves exactly like :py:class:`SchemeDictionaryDestination`, except that
+    it has no side effects: no files or directories are created, no timestamps
+    are touched and no bytecode is compiled. Instead, every file that would
+    have been written is recorded in :py:attr:`plan`, in the order it would
+    have been written, so that the plan can be compared against a real
+    installation entry by entry.
+    """
+
+    plan: list[tuple[Scheme, RecordEntry, str]] = field(
+        default_factory=list, init=False
+    )
+    """Files that would be written, as ``(scheme, record_entry, target_path)``."""
+
+    def write_to_fs(
+        self,
+        scheme: Scheme,
+        path: str,
+        stream: BinaryIO,
+        is_executable: bool,
+    ) -> RecordEntry:
+        """Record what :py:meth:`SchemeDictionaryDestination.write_to_fs` would write.
+
+        Computes the same target path, hash and size as a real write, but
+        discards the contents instead of touching the filesystem.
+        """
+        target_path = self._path_with_destdir(scheme, path)
+        hash_, size = copyfileobj_with_hashing(
+            stream, _DiscardingSink(), self.hash_algorithm
+        )
+        record = RecordEntry(path, Hash(self.hash_algorithm, hash_), size)
+        self.plan.append((scheme, record, str(target_path)))
+        return record
+
+    def write_script(
+        self, name: str, module: str, attr: str, section: "ScriptSection"
+    ) -> RecordEntry:
+        """Record the script that would be generated for an entrypoint.
+
+        Generates the same launcher (and name) as a real install, but does not
+        write it or adjust any file permissions.
+        """
+        script = Script(name, module, attr, section)
+        script_name, data = script.generate(self.interpreter, self.script_kind)
+
+        with io.BytesIO(data) as stream:
+            return self.write_to_fs(
+                Scheme("scripts"), script_name, stream, is_executable=True
+            )
+
+    def _compile_bytecode(self, scheme: Scheme, record: RecordEntry) -> None:
+        """Do nothing: planning must not execute bytecode compilation."""

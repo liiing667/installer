@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from installer.destinations import SchemeDictionaryDestination, WheelDestination
+from installer.destinations import (
+    PlanDestination,
+    SchemeDictionaryDestination,
+    WheelDestination,
+)
 from installer.records import RecordEntry
 from installer.scripts import Script
 from installer.utils import SCHEME_NAMES
@@ -197,3 +201,80 @@ class TestSchemeDictionaryDestination:
     def test_blocking_path_traversal(self, destination):
         with pytest.raises(ValueError):
             destination._path_with_destdir("purelib", "subdir/../../outside.txt")
+
+
+class TestPlanDestination:
+    @pytest.fixture()
+    def destination(self, tmp_path):
+        scheme_dict = {}
+        for scheme in SCHEME_NAMES:
+            scheme_dict[scheme] = str(tmp_path / scheme)
+        return PlanDestination(
+            scheme_dict,
+            "/my/python",
+            "posix",
+            bytecode_optimization_levels=[0, 1],
+        )
+
+    def test_write_file_records_plan_without_writing(self, destination, tmp_path):
+        record = destination.write_file(
+            scheme="purelib",
+            path="pkg/module.py",
+            stream=io.BytesIO(b"print('hello')\n"),
+            is_executable=False,
+        )
+
+        assert record.path == "pkg/module.py"
+        assert record.size == len(b"print('hello')\n")
+        assert record.hash_.validate(b"print('hello')\n")
+
+        assert destination.plan == [
+            ("purelib", record, str(tmp_path / "purelib" / "pkg" / "module.py"))
+        ]
+        assert not (tmp_path / "purelib").exists()
+
+    def test_write_file_fixes_shebang(self, destination):
+        record = destination.write_file(
+            scheme="scripts",
+            path="my_script",
+            stream=io.BytesIO(b"#!python\nmy script"),
+            is_executable=True,
+        )
+
+        assert record.hash_.validate(b"#!/my/python\nmy script")
+        assert record.size == len(b"#!/my/python\nmy script")
+
+    def test_write_script_records_plan_without_writing(self, destination, tmp_path):
+        record = destination.write_script(
+            name="my-entrypoint",
+            module="my.module",
+            attr="main",
+            section="console",
+        )
+
+        script = Script("my-entrypoint", "my.module", "main", "console")
+        script_name, data = script.generate("/my/python", "posix")
+
+        assert record.path == script_name
+        assert record.hash_.validate(data)
+
+        assert destination.plan == [
+            ("scripts", record, str(tmp_path / "scripts" / script_name))
+        ]
+        assert not (tmp_path / "scripts").exists()
+
+    def test_finalize_installation_records_record_file_only(
+        self, destination, tmp_path
+    ):
+        record = RecordEntry("pkg/module.py", None, None)
+        destination.finalize_installation(
+            scheme="purelib",
+            record_file_path="pkg-1.0.0.dist-info/RECORD",
+            records=[("purelib", record)],
+        )
+
+        assert [entry.path for _, entry, _ in destination.plan] == [
+            "pkg-1.0.0.dist-info/RECORD"
+        ]
+        assert not (tmp_path / "purelib").exists()
+        assert not list(tmp_path.rglob("*.pyc"))
