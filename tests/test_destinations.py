@@ -3,8 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from installer.destinations import SchemeDictionaryDestination, WheelDestination
-from installer.records import RecordEntry
+from installer.destinations import (
+    DryRunDestination,
+    SchemeDictionaryDestination,
+    WheelDestination,
+)
+from installer.records import RecordEntry, parse_record_file
 from installer.scripts import Script
 from installer.utils import SCHEME_NAMES
 
@@ -197,3 +201,119 @@ class TestSchemeDictionaryDestination:
     def test_blocking_path_traversal(self, destination):
         with pytest.raises(ValueError):
             destination._path_with_destdir("purelib", "subdir/../../outside.txt")
+
+
+class TestDryRunDestination:
+    @pytest.fixture()
+    def scheme_dict(self, tmp_path):
+        scheme_dict = {}
+        for scheme in SCHEME_NAMES:
+            full_path = tmp_path / scheme
+            full_path.mkdir()
+            scheme_dict[scheme] = str(full_path)
+        return scheme_dict
+
+    @pytest.mark.parametrize(
+        ("scheme", "path", "data"),
+        [
+            ("data", "my_data.bin", b"my data"),
+            ("data", "data_folder/my_data.bin", b"my data"),
+            ("scripts", "my_script.py", b"#!python\nmy script"),
+            ("scripts", "script_folder/my_script.py", b"#!python\nmy script"),
+            ("purelib", "my_module/__init__.py", b"def x(): ...\n"),
+        ],
+    )
+    def test_write_file_matches_real_install(self, scheme_dict, scheme, path, data):
+        dry_destination = DryRunDestination("/my/python", "posix")
+        real_destination = SchemeDictionaryDestination(
+            scheme_dict, "/my/python", "posix"
+        )
+
+        before = sorted(Path(scheme_dict[scheme]).rglob("*"))
+
+        dry_record = dry_destination.write_file(scheme, path, io.BytesIO(data), False)
+        assert sorted(Path(scheme_dict[scheme]).rglob("*")) == before
+
+        real_record = real_destination.write_file(scheme, path, io.BytesIO(data), False)
+
+        assert dry_record == real_record
+
+    def test_write_script_matches_real_install(self, scheme_dict):
+        script_args = ("my_entrypoint", "my_module", "my_function", "console")
+        dry_destination = DryRunDestination("/my/python", "posix")
+        real_destination = SchemeDictionaryDestination(
+            scheme_dict, "/my/python", "posix"
+        )
+
+        before = sorted(Path(scheme_dict["scripts"]).rglob("*"))
+
+        dry_record = dry_destination.write_script(*script_args)
+        assert sorted(Path(scheme_dict["scripts"]).rglob("*")) == before
+
+        real_record = real_destination.write_script(*script_args)
+
+        assert dry_record == real_record
+
+    def test_finalize_collects_records_without_writing(self, scheme_dict):
+        dry_destination = DryRunDestination("/my/python", "posix")
+        real_destination = SchemeDictionaryDestination(
+            scheme_dict, "/my/python", "posix"
+        )
+
+        operations = [
+            ("write_file", ("data", "my_data.bin", b"my data", False)),
+            ("write_file", ("scripts", "my_script", b"#!python\nmy script", False)),
+            ("write_script", ("my_entrypoint", "my_module", "my_function", "console")),
+        ]
+
+        dry_records = []
+        real_records = []
+        for method_name, args in operations:
+            if method_name == "write_file":
+                scheme, path, data, is_executable = args
+                dry_record = dry_destination.write_file(
+                    scheme, path, io.BytesIO(data), is_executable
+                )
+                real_record = real_destination.write_file(
+                    scheme, path, io.BytesIO(data), is_executable
+                )
+            else:
+                dry_record = dry_destination.write_script(*args)
+                real_record = real_destination.write_script(*args)
+            assert dry_record == real_record
+            dry_records.append(
+                ("scripts" if method_name == "write_script" else args[0], dry_record)
+            )
+            real_records.append(
+                ("scripts" if method_name == "write_script" else args[0], real_record)
+            )
+
+        dry_records.append(("purelib", RecordEntry("RECORD", None, None)))
+        real_records.append(("purelib", RecordEntry("RECORD", None, None)))
+
+        before = {
+            scheme: sorted(Path(path).rglob("*"))
+            for scheme, path in scheme_dict.items()
+        }
+        dry_destination.finalize_installation("purelib", "RECORD", dry_records)
+
+        assert dry_destination.records == dry_records
+        # The dry run does not write RECORD or bytecode anywhere.
+        for scheme, path in scheme_dict.items():
+            assert sorted(Path(path).rglob("*")) == before[scheme]
+
+        real_destination.finalize_installation("purelib", "RECORD", real_records)
+
+        written_record = (Path(scheme_dict["purelib"]) / "RECORD").read_bytes()
+        written_rows = list(parse_record_file(written_record.decode().splitlines()))
+        assert len(written_rows) == 4
+        written_paths = {row[0] for row in written_rows}
+        for expected_path in (
+            "data/my_data.bin",
+            "scripts/my_script",
+            "scripts/my_entrypoint",
+            "RECORD",
+        ):
+            assert any(
+                written_path.endswith(expected_path) for written_path in written_paths
+            )

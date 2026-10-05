@@ -1,9 +1,11 @@
 """Handles all file writing and post-installation processing."""
 
+import base64
+import hashlib
 import io
 import os
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -304,3 +306,79 @@ class SchemeDictionaryDestination(WheelDestination):
 
         for scheme_, record in record_list:
             self._compile_bytecode(scheme_, record)
+
+
+@dataclass
+class DryRunDestination(WheelDestination):
+    """Destination that plans an installation without touching the filesystem.
+
+    Performs the exact same in-memory computations as
+    :py:class:`SchemeDictionaryDestination` (script generation, shebang
+    rewriting, hashing), so the collected records match a real installation
+    entry-by-entry. Nothing is written to disk: no files, no directories, no
+    bytecode compilation.
+    """
+
+    interpreter: str
+    """The interpreter to use for generating scripts."""
+
+    script_kind: "LauncherKind"
+    """The "kind" of launcher script to use."""
+
+    hash_algorithm: str = "sha256"
+    """The hashing algorithm to use for the generated record entries."""
+
+    records: list[tuple[Scheme, RecordEntry]] = field(default_factory=list, init=False)
+    """The ``(scheme, record)`` pairs a real installation would have written."""
+
+    def _record_entry(self, path: str, stream: BinaryIO) -> RecordEntry:
+        """Compute the record entry for ``stream`` without writing it anywhere."""
+        hasher = hashlib.new(self.hash_algorithm)
+        size = 0
+        while True:
+            buf = stream.read(64 * 1024)
+            if not buf:
+                break
+            hasher.update(buf)
+            size += len(buf)
+        value = base64.urlsafe_b64encode(hasher.digest()).decode("ascii").rstrip("=")
+        return RecordEntry(path, Hash(self.hash_algorithm, value), size)
+
+    def write_file(
+        self,
+        scheme: Scheme,
+        path: Union[str, "os.PathLike[str]"],
+        stream: BinaryIO,
+        is_executable: bool,
+    ) -> RecordEntry:
+        """Compute the record entry for a file, without writing it.
+
+        Applies the same shebang rewriting as a real installation, so the
+        resulting hash and size are identical.
+        """
+        path_ = os.fspath(path)
+
+        if scheme == "scripts":
+            with fix_shebang(stream, self.interpreter) as stream_with_different_shebang:
+                return self._record_entry(path_, stream_with_different_shebang)
+
+        return self._record_entry(path_, stream)
+
+    def write_script(
+        self, name: str, module: str, attr: str, section: "ScriptSection"
+    ) -> RecordEntry:
+        """Generate the script in memory and compute its record entry."""
+        script = Script(name, module, attr, section)
+        script_name, data = script.generate(self.interpreter, self.script_kind)
+
+        with io.BytesIO(data) as stream:
+            return self._record_entry(script_name, stream)
+
+    def finalize_installation(
+        self,
+        scheme: Scheme,
+        record_file_path: str,
+        records: Iterable[tuple[Scheme, RecordEntry]],
+    ) -> None:
+        """Collect the final records, without writing ``RECORD`` or bytecode."""
+        self.records = list(records)
